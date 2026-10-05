@@ -1,0 +1,478 @@
+---
+title: "Predicting High-Volume Purchases in E-commerce with Statistical Machine Learning"
+author: "Irene Undiandeye"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.width = 8, fig.height = 4.5, cache = TRUE)
+
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(caret)
+library(ranger)
+library(gbm)
+library(rpart)
+library(nnet)
+library(pROC)
+
+dir.create("images", showWarnings = FALSE)
+theme_set(theme_minimal(base_size = 12))
+set.seed(123)
+```
+
+# Introduction
+
+E-commerce businesses that sell to both consumers and trade buyers benefit from knowing in advance which orders will involve large quantities. Bulk orders affect stock planning, warehouse picking and shipping, and they identify customers who may respond to volume pricing. This project builds and compares statistical machine learning models that predict whether an order line will be a **high-volume purchase**, defined as an order line with a quantity of 10 or more units of the same product.
+
+The data contains 541,909 transaction lines from a UK-based online retailer of gifts and homeware between December 2010 and December 2011. Each line records the invoice, product, quantity, date and time, unit price, customer and country.
+
+# Variables
+
+The target is binary: whether the quantity on an order line is at least 10. The input variables are chosen so that all of them would be known when an order is placed, and none is derived from the quantity itself.
+
+| Variable | Description |
+|---|---|
+| `log_price` | Logarithm of the unit price. Bulk purchases tend to involve cheaper items. |
+| `prod_rate` | The product's historical share of high-volume order lines, estimated from an earlier period (see Section 4). |
+| `log_prod_lines` | The product's historical popularity: logarithm of its number of order lines in the earlier period. |
+| `new_product` | Whether the product did not appear in the earlier period. |
+| `cust_rate` | The customer's historical share of high-volume order lines, estimated from the earlier period. |
+| `known_customer` | Whether the order has a customer ID (25% of lines are anonymous). |
+| `returning_customer` | Whether the customer already ordered in the earlier period. |
+| `log_basket` | Logarithm of the number of distinct products on the same invoice. |
+| `country` | Customer country: the six largest markets and "Other". |
+| `hour`, `weekday`, `month` | Time of the order. |
+
+# Data Preparation
+
+```{r load}
+raw <- read.csv("data/E-commerce.csv", encoding = "latin1", stringsAsFactors = FALSE)
+dim(raw)
+summary(raw[, c("Quantity", "UnitPrice", "CustomerID")])
+```
+
+The summary reveals several problems. Quantities and prices can be negative, a quarter of customer IDs are missing, and the data includes cancellations and non-product entries.
+
+```{r quality}
+service_codes <- c("POST", "DOT", "M", "m", "C2", "D", "S", "BANK CHARGES", "AMAZONFEE", "CRUK", "B", "PADS")
+data.frame(
+  Check = c("Duplicated rows", "Cancellation lines (invoice starts with C)", "Quantity <= 0",
+            "Unit price <= 0", "Non-product codes (postage, fees, adjustments, vouchers)", "Missing customer ID"),
+  Rows = c(sum(duplicated(raw)), sum(grepl("^C", raw$InvoiceNo)), sum(raw$Quantity <= 0), sum(raw$UnitPrice <= 0),
+           sum(raw$StockCode %in% service_codes | grepl("^gift_", raw$StockCode)), sum(is.na(raw$CustomerID)))
+)
+```
+
+Cancellations, negative quantities and non-product codes are not purchases, so leaving them in would label every return as a "low-volume purchase". They are removed, together with exact duplicates and lines with a non-positive price. Missing customer IDs are kept, because these orders are still valid purchases; anonymity is captured by the `known_customer` indicator instead.
+
+```{r clean}
+df <- raw %>%
+  distinct() %>%
+  filter(!grepl("^C", InvoiceNo), Quantity > 0, UnitPrice > 0,
+         !StockCode %in% service_codes, !grepl("^gift_", StockCode)) %>%
+  mutate(InvoiceDate = mdy_hm(InvoiceDate),
+         HighVolume = as.integer(Quantity >= 10))
+
+cat("Lines after cleaning:", format(nrow(df), big.mark = ","), "\n")
+cat("Share of high-volume lines:", round(mean(df$HighVolume) * 100, 1), "%\n")
+cat("Failed date conversions:", sum(is.na(df$InvoiceDate)), "\n")
+```
+
+# Exploratory Analysis
+
+```{r target-dist}
+ggplot(df, aes(factor(HighVolume, labels = c("Low volume (< 10)", "High volume (>= 10)")))) +
+  geom_bar(fill = "#4c72b0") +
+  geom_text(stat = "count", aes(label = scales::comma(after_stat(count))), vjust = -0.4) +
+  labs(title = "Distribution of the target", x = NULL, y = "Order lines")
+```
+
+About 29% of order lines are high-volume, so the classes are moderately imbalanced. For this reason, models are compared using the area under the ROC curve (AUC), which does not depend on a classification threshold or on the class balance.
+
+```{r price}
+ggplot(df, aes(factor(HighVolume, labels = c("Low volume", "High volume")), UnitPrice)) +
+  geom_boxplot(fill = "#55a868", outlier.alpha = 0.05) +
+  scale_y_log10() +
+  labs(title = "Unit price by purchase type", x = NULL, y = "Unit price (log scale)")
+```
+
+High-volume lines involve markedly cheaper items: customers buy inexpensive products in bulk and expensive products singly.
+
+```{r country}
+df %>%
+  group_by(Country) %>%
+  summarise(lines = n(), rate = mean(HighVolume)) %>%
+  filter(lines >= 2000) %>%
+  ggplot(aes(reorder(Country, rate), rate * 100)) +
+  geom_col(fill = "#8172b2") +
+  coord_flip() +
+  labs(title = "Share of high-volume lines by country (countries with 2,000+ lines)",
+       x = NULL, y = "High-volume lines (%)")
+```
+
+The United Kingdom accounts for about nine in ten order lines but has the *lowest* share of high-volume purchases. Customers abroad, many of them retailers placing trade orders, buy in bulk far more often.
+
+```{r time}
+df %>%
+  mutate(hour = hour(InvoiceDate)) %>%
+  group_by(hour) %>%
+  summarise(lines = n(), rate = mean(HighVolume)) %>%
+  filter(lines > 500) %>%
+  ggplot(aes(hour, rate * 100)) +
+  geom_line(color = "#c44e52") + geom_point(color = "#c44e52") +
+  labs(title = "Share of high-volume lines by hour of day", x = "Hour", y = "High-volume lines (%)")
+```
+
+Bulk orders are concentrated in the morning, when trade customers place orders during business hours, and become rarer through the afternoon and evening.
+
+```{r basket}
+df %>%
+  group_by(InvoiceNo) %>%
+  mutate(basket = n()) %>%
+  ungroup() %>%
+  mutate(basket_band = cut(basket, c(0, 5, 10, 25, 50, 100, Inf),
+                           labels = c("1-5", "6-10", "11-25", "26-50", "51-100", "100+"))) %>%
+  group_by(basket_band) %>%
+  summarise(rate = mean(HighVolume)) %>%
+  ggplot(aes(basket_band, rate * 100)) +
+  geom_col(fill = "#4c72b0") +
+  labs(title = "Share of high-volume lines by number of products on the invoice",
+       x = "Products on the invoice", y = "High-volume lines (%)")
+```
+
+Small orders with only a few products are much more likely to contain bulk quantities than very large baskets, which suggests two distinct buying patterns: trade customers stocking up on a few items, and shoppers ordering many items in small quantities.
+
+# Feature Engineering and Data Split
+
+Product identity and customer identity are likely to be the strongest predictors, but `StockCode` has almost 4,000 levels and `CustomerID` over 4,000, too many to use as categorical variables (the first version of this project ran out of memory trying). Instead, each product and customer is summarised by its historical share of high-volume lines.
+
+To avoid leaking the target into the inputs, these histories are computed from an **earlier period** (December 2010 to March 2011) that is never used for modelling. The models are trained and evaluated only on orders from April to December 2011. Rates are smoothed towards the overall average, so that products or customers with few past lines are not assigned extreme values.
+
+```{r features}
+history_end <- as.POSIXct("2011-04-01", tz = "UTC")
+history <- df %>% filter(InvoiceDate < history_end)
+modelling <- df %>% filter(InvoiceDate >= history_end)
+
+global_rate <- mean(history$HighVolume)
+k <- 10  # smoothing strength
+
+product_history <- history %>%
+  group_by(StockCode) %>%
+  summarise(prod_lines = n(), prod_rate = (sum(HighVolume) + k * global_rate) / (n() + k))
+
+customer_history <- history %>%
+  filter(!is.na(CustomerID)) %>%
+  group_by(CustomerID) %>%
+  summarise(cust_rate = (sum(HighVolume) + k * global_rate) / (n() + k))
+
+top_countries <- c("United Kingdom", "Germany", "France", "EIRE", "Netherlands", "Spain")
+
+model_data <- modelling %>%
+  add_count(InvoiceNo, name = "basket_lines") %>%
+  left_join(product_history, by = "StockCode") %>%
+  left_join(customer_history, by = "CustomerID") %>%
+  mutate(
+    new_product = as.integer(is.na(prod_rate)),
+    prod_rate = coalesce(prod_rate, global_rate),
+    log_prod_lines = log1p(coalesce(prod_lines, 0L)),
+    known_customer = as.integer(!is.na(CustomerID)),
+    returning_customer = as.integer(!is.na(cust_rate)),
+    cust_rate = coalesce(cust_rate, global_rate),
+    log_price = log(UnitPrice),
+    log_basket = log(basket_lines),
+    country = factor(ifelse(Country %in% top_countries, Country, "Other")),
+    hour = hour(InvoiceDate),
+    weekday = factor(wday(InvoiceDate, label = TRUE), ordered = FALSE),
+    month = month(InvoiceDate),
+    target = factor(ifelse(HighVolume == 1, "yes", "no"), levels = c("no", "yes"))
+  )
+
+features <- c("log_price", "prod_rate", "log_prod_lines", "new_product", "cust_rate", "known_customer",
+              "returning_customer", "log_basket", "country", "hour", "weekday", "month")
+cat("History lines:", format(nrow(history), big.mark = ","),
+    "| Modelling lines:", format(nrow(model_data), big.mark = ","), "\n")
+```
+
+The modelling data is split into training and test sets **by invoice**, so that all lines of an order fall on the same side. A random split by line would place lines from the same order in both sets, and because lines on one order share the customer, country and time, the test score would be optimistically biased. For the same reason, the 5-fold cross-validation folds are also grouped by invoice. To keep tuning computationally feasible, a random sample of 30,000 training lines is used for model fitting; the test set is kept in full.
+
+```{r split}
+invoices <- unique(model_data$InvoiceNo)
+test_invoices <- sample(invoices, round(0.2 * length(invoices)))
+
+train_full <- model_data %>% filter(!InvoiceNo %in% test_invoices)
+test_data <- model_data %>% filter(InvoiceNo %in% test_invoices)
+train_data <- train_full[sample(nrow(train_full), 30000), ]
+
+cat("Training sample:", nrow(train_data), "lines | Test set:", format(nrow(test_data), big.mark = ","), "lines\n")
+cat("High-volume share - training:", round(mean(train_data$HighVolume), 3), "| test:", round(mean(test_data$HighVolume), 3), "\n")
+
+X_train <- train_data[, c(features, "target")]
+
+# Free memory: the raw and intermediate tables are no longer needed
+test_data <- test_data[, c(features, "target", "HighVolume")]
+rm(raw, df, history, modelling, model_data, train_full); invisible(gc())
+
+folds <- groupKFold(train_data$InvoiceNo, k = 5)
+cv_control <- trainControl(index = folds, classProbs = TRUE, summaryFunction = twoClassSummary,
+                           savePredictions = "final")
+```
+
+All models receive the same twelve inputs and are evaluated on the same folds. For each model, the **training AUC** is computed on the full training sample and the **CV AUC** is the average over the five held-out folds.
+
+```{r helpers}
+train_auc <- function(model, data) {
+  as.numeric(auc(data$target, predict(model, data, type = "prob")$yes, quiet = TRUE))
+}
+cv_auc <- function(model) max(model$results$ROC)
+results <- data.frame()
+record <- function(name, model, data = X_train, pca = "No") {
+  row <- data.frame(Model = name, PCA = pca, Train_AUC = train_auc(model, data), CV_AUC = cv_auc(model))
+  results <<- rbind(results, row)
+  row
+}
+```
+
+# Models 1 and 2
+
+## Model 1: Logistic regression
+
+```{r logit}
+logit_model <- train(target ~ ., data = X_train, method = "glm", family = "binomial",
+                     trControl = cv_control, metric = "ROC")
+summary(logit_model$finalModel)$coefficients[, c("Estimate", "Pr(>|z|)")] %>% round(4)
+record("Logistic regression", logit_model)
+```
+
+## Model 2: Decision tree
+
+The complexity parameter `cp`, which controls how strongly the tree is pruned, is tuned by cross-validation.
+
+```{r tree}
+tree_model <- train(target ~ ., data = X_train, method = "rpart", trControl = cv_control, metric = "ROC",
+                    tuneGrid = expand.grid(cp = c(0.0005, 0.001, 0.002, 0.005, 0.01)))
+ggplot(tree_model) + labs(title = "Decision tree: CV AUC by complexity parameter")
+record("Decision tree", tree_model)
+```
+
+The logistic regression achieves a CV AUC of about 0.91 and the tuned decision tree slightly less. Both show almost no gap between training and CV AUC, so neither is overfitting. Among the logistic coefficients, the customer's and product's histories of bulk buying have the largest positive effects, while a higher unit price, a larger basket and an order from the United Kingdom all make a high-volume line less likely.
+
+# Ensemble Methods
+
+## Ensemble 1: Random forest (bagging)
+
+A random forest averages many decision trees, each trained on a bootstrap sample with a random subset of variables considered at each split. The number of variables per split (`mtry`) and the minimum node size are tuned.
+
+```{r rf}
+rf_model <- train(target ~ ., data = X_train, method = "ranger", trControl = cv_control, metric = "ROC",
+                  num.trees = 250, importance = "impurity",
+                  tuneGrid = expand.grid(mtry = c(2, 4, 6), splitrule = "gini", min.node.size = c(20, 50)))
+ggplot(rf_model) + labs(title = "Random forest: CV AUC by tuning parameters")
+rf_model$bestTune
+record("Random forest", rf_model)
+```
+
+## Ensemble 2: Gradient boosting
+
+Gradient boosting builds trees sequentially, each correcting the errors of the previous ones. The number of trees, tree depth and learning rate are tuned.
+
+```{r gbm}
+gbm_model <- train(target ~ ., data = X_train, method = "gbm", trControl = cv_control, metric = "ROC",
+                   verbose = FALSE,
+                   tuneGrid = expand.grid(n.trees = c(100, 300, 500), interaction.depth = c(3, 6),
+                                          shrinkage = c(0.05, 0.1), n.minobsinnode = 20))
+ggplot(gbm_model) + labs(title = "Gradient boosting: CV AUC by tuning parameters")
+gbm_model$bestTune
+record("Gradient boosting", gbm_model)
+```
+
+Both ensembles improve on the single models, reaching a CV AUC of about 0.93. The random forest fits the training data almost perfectly, so its training AUC is far above its CV AUC; this is typical of random forests and does not harm its CV performance. Gradient boosting reaches a similar CV AUC with a much smaller gap between training and CV performance.
+
+# Neural Network
+
+A single-hidden-layer neural network is fitted in three configurations of increasing size, with weight decay to regularise it. Inputs are centred and scaled within each fold, which neural networks need in order to train well.
+
+```{r nn}
+nn_configs <- list(
+  "Neural network (3 units, decay 0.1)"    = expand.grid(size = 3, decay = 0.1),
+  "Neural network (8 units, decay 0.01)"   = expand.grid(size = 8, decay = 0.01),
+  "Neural network (15 units, decay 0.001)" = expand.grid(size = 15, decay = 0.001)
+)
+nn_models <- lapply(nn_configs, function(grid) {
+  train(target ~ ., data = X_train, method = "nnet", trControl = cv_control, metric = "ROC",
+        preProcess = c("center", "scale"), tuneGrid = grid, trace = FALSE, maxit = 300)
+})
+nn_table <- do.call(rbind, lapply(names(nn_models), function(n) {
+  data.frame(Configuration = n, Train_AUC = train_auc(nn_models[[n]], X_train), CV_AUC = cv_auc(nn_models[[n]]))
+}))
+nn_table
+best_nn_name <- nn_table$Configuration[which.max(nn_table$CV_AUC)]
+nn_model <- nn_models[[best_nn_name]]
+cat("Selected configuration:", best_nn_name, "\n")
+record("Neural network", nn_model)
+```
+
+The three configurations perform similarly. The larger networks fit the training data slightly better, but this does not translate into a meaningful improvement in CV AUC, and the best network ranks between the single models and the ensembles.
+
+# Model Comparison
+
+```{r comparison}
+results %>% mutate(across(c(Train_AUC, CV_AUC), ~ round(.x, 4))) %>% arrange(desc(CV_AUC))
+```
+
+```{r comparison-plot}
+results %>%
+  select(Model, Train_AUC, CV_AUC) %>%
+  pivot_longer(-Model, names_to = "Metric", values_to = "AUC") %>%
+  mutate(Metric = recode(Metric, Train_AUC = "Training", CV_AUC = "Cross-validation")) %>%
+  ggplot(aes(reorder(Model, AUC), AUC, fill = Metric)) +
+  geom_col(position = "dodge") +
+  coord_flip(ylim = c(0.85, 1)) +
+  scale_fill_manual(values = c("Cross-validation" = "#4c72b0", "Training" = "#c7d3e8")) +
+  labs(title = "Training and CV AUC by model", x = NULL, y = "AUC")
+```
+
+The two ensembles perform best, followed by the neural network, the logistic regression and the decision tree. The differences between the top models are small, which shows that most of the predictive information is captured by a few strong inputs that even a linear model can use.
+
+# PCA
+
+PCA is applied to the input variables after converting the categorical variables (country and weekday) to dummy variables and standardising all inputs.
+
+```{r pca}
+dummies <- dummyVars(~ ., data = train_data[, features], fullRank = TRUE)
+X_num <- as.data.frame(predict(dummies, train_data[, features]))
+pca <- prcomp(X_num, center = TRUE, scale. = TRUE)
+variance <- data.frame(PC = seq_along(pca$sdev), Share = pca$sdev^2 / sum(pca$sdev^2)) %>%
+  mutate(Cumulative = cumsum(Share))
+cat("Input columns after dummy encoding:", ncol(X_num), "\n")
+cat("Components needed for 90% of variance:", which(variance$Cumulative >= 0.9)[1], "\n")
+
+ggplot(variance, aes(PC, Cumulative * 100)) +
+  geom_line(color = "#4c72b0") + geom_point(color = "#4c72b0") +
+  geom_hline(yintercept = 90, linetype = "dashed", color = "grey50") +
+  labs(title = "Cumulative variance explained by principal components", x = "Principal component",
+       y = "Cumulative variance explained (%)")
+```
+
+```{r pca-loadings}
+round(pca$rotation[, 1:3], 2)
+```
+
+The scope for dimensionality reduction is limited. The inputs are not strongly correlated with each other, apart from the customer variables, so variance is spread across many components, and 15 of the 21 components are needed to retain 90% of it. The first component mainly contrasts known, returning customers with large-basket UK orders, and the second captures product popularity.
+
+All five models are rerun on the principal components that explain 90% of the variance. The PCA is fitted inside each cross-validation fold, so the held-out fold never influences the components.
+
+```{r pca-models}
+X_pca_train <- cbind(X_num, target = train_data$target)
+pca_pre <- c("center", "scale", "pca")
+pca_ctrl <- cv_control
+pca_ctrl$preProcOptions <- list(thresh = 0.9)
+
+pca_models <- list(
+  "Logistic regression" = train(target ~ ., data = X_pca_train, method = "glm", family = "binomial",
+                                trControl = pca_ctrl, metric = "ROC", preProcess = pca_pre),
+  "Decision tree" = train(target ~ ., data = X_pca_train, method = "rpart", trControl = pca_ctrl, metric = "ROC",
+                          preProcess = pca_pre, tuneGrid = expand.grid(cp = c(0.0005, 0.001, 0.002, 0.005, 0.01))),
+  "Random forest" = train(target ~ ., data = X_pca_train, method = "ranger", trControl = pca_ctrl, metric = "ROC",
+                          preProcess = pca_pre, num.trees = 250,
+                          tuneGrid = expand.grid(mtry = c(2, 4, 6), splitrule = "gini", min.node.size = c(20, 50))),
+  "Gradient boosting" = train(target ~ ., data = X_pca_train, method = "gbm", trControl = pca_ctrl, metric = "ROC",
+                              preProcess = pca_pre, verbose = FALSE,
+                              tuneGrid = expand.grid(n.trees = c(100, 300, 500), interaction.depth = c(3, 6),
+                                                     shrinkage = c(0.05, 0.1), n.minobsinnode = 20)),
+  "Neural network" = train(target ~ ., data = X_pca_train, method = "nnet", trControl = pca_ctrl, metric = "ROC",
+                           preProcess = pca_pre, tuneGrid = nn_configs[[best_nn_name]], trace = FALSE, maxit = 300)
+)
+for (n in names(pca_models)) record(n, pca_models[[n]], data = X_pca_train, pca = "Yes")
+results %>% filter(PCA == "Yes") %>% mutate(across(c(Train_AUC, CV_AUC), ~ round(.x, 4)))
+```
+
+Every model performs worse on the principal components than on the original inputs. PCA chooses components by how much variance they explain, not by how well they predict the target, so with only modest correlation between inputs it discards some useful information while saving little. The tree-based models and the logistic regression lose between 0.014 and 0.020 in AUC, because PCA mixes variables together and blurs the clear signals, such as "this customer usually buys in bulk", that these models exploit. The neural network, which already combines inputs internally, loses the least.
+
+# Model Selection
+
+```{r selection}
+final_table <- results %>%
+  mutate(across(c(Train_AUC, CV_AUC), ~ round(.x, 4))) %>%
+  arrange(desc(CV_AUC))
+final_table
+```
+
+```{r selection-plot}
+p <- results %>%
+  mutate(Label = paste0(Model, ifelse(PCA == "Yes", " (PCA)", ""))) %>%
+  ggplot(aes(reorder(Label, CV_AUC), CV_AUC, fill = PCA)) +
+  geom_col() +
+  geom_text(aes(label = sprintf("%.3f", CV_AUC)), hjust = -0.1, size = 3.5) +
+  coord_flip(ylim = c(0.8, 0.96)) +
+  scale_fill_manual(values = c("No" = "#4c72b0", "Yes" = "#dd8452")) +
+  labs(title = "Cross-validated AUC of all ten models", x = NULL, y = "CV AUC", fill = "PCA")
+ggsave("images/model_comparison.png", p, width = 8, height = 4.5, dpi = 120)
+p
+```
+
+```{r best-model}
+best <- final_table[1, ]
+best_model <- if (best$PCA == "Yes") pca_models[[best$Model]] else
+  list("Logistic regression" = logit_model, "Decision tree" = tree_model, "Random forest" = rf_model,
+       "Gradient boosting" = gbm_model, "Neural network" = nn_model)[[best$Model]]
+best_test <- if (best$PCA == "Yes") cbind(as.data.frame(predict(dummies, test_data[, features])), target = test_data$target) else
+  test_data[, c(features, "target")]
+cat("Best model by CV AUC:", best$Model, ifelse(best$PCA == "Yes", "(PCA)", ""), "\n")
+```
+
+## Expected performance on the test set
+
+The selected model is evaluated once on the untouched test set of about 77,000 order lines from invoices it has never seen.
+
+```{r test}
+test_prob <- predict(best_model, best_test, type = "prob")$yes
+roc_test <- roc(test_data$target, test_prob, quiet = TRUE)
+cat("Test AUC:", round(as.numeric(auc(roc_test)), 4), "\n")
+cat("CV AUC:  ", round(best$CV_AUC, 4), "\n")
+
+test_class <- factor(ifelse(test_prob >= 0.5, "yes", "no"), levels = c("no", "yes"))
+confusionMatrix(test_class, test_data$target, positive = "yes")
+```
+
+```{r roc-plot}
+roc_df <- data.frame(fpr = 1 - roc_test$specificities, tpr = roc_test$sensitivities)
+p <- ggplot(roc_df, aes(fpr, tpr)) +
+  geom_line(color = "#4c72b0", linewidth = 1) +
+  geom_abline(linetype = "dashed", color = "grey50") +
+  labs(title = sprintf("ROC curve of the best model on the test set (AUC = %.3f)", as.numeric(auc(roc_test))),
+       x = "False positive rate", y = "True positive rate")
+ggsave("images/test_roc.png", p, width = 6.5, height = 5, dpi = 120)
+p
+```
+
+```{r importance}
+imp <- varImp(best_model)$importance
+imp$Variable <- rownames(imp)
+imp <- imp[order(-imp[, 1]), ][1:10, ]
+p <- ggplot(imp, aes(reorder(Variable, imp[, 1]), imp[, 1])) +
+  geom_col(fill = "#4c72b0") +
+  coord_flip() +
+  labs(title = "Variable importance in the best model", x = NULL, y = "Relative importance")
+ggsave("images/variable_importance.png", p, width = 7, height = 4.5, dpi = 120)
+p
+```
+
+The test AUC is very close to the CV AUC, confirming that the cross-validation estimate was reliable and that the model generalises to new orders. The customer's history of bulk purchases is the most important input, followed by the unit price, the basket size and the product's history.
+
+# Conclusions
+
+This project predicts whether an order line will be a high-volume purchase of 10 or more units. After removing cancellations, returns and non-product entries, five models were trained on twelve inputs and compared using cross-validated AUC, with folds and the train–test split grouped by invoice to prevent leakage between related order lines.
+
+The ensembles performed best, with gradient boosting selected as the final model (CV AUC 0.928). On the held-out test set of 77,606 order lines it achieved an AUC of 0.933 and classified 88% of lines correctly, identifying 77% of high-volume lines while correctly clearing 93% of low-volume ones. The logistic regression was only slightly behind, which shows that most of the predictive information lies in a few strong inputs: the customer's past buying behaviour, the unit price, the size of the order and whether the product is typically bought in bulk. PCA reduced performance for every model, because the inputs carry largely distinct information.
+
+Two design choices made the largest difference compared with the first version of this project. First, summarising products and customers by their purchase histories from an earlier period kept the most informative variables without creating thousands of dummy variables or leaking the target. Second, grouping the data split by invoice gives an honest estimate of how the model would perform on genuinely new orders.
+
+For the business, the model could flag likely bulk orders at checkout for stock and fulfilment planning and identify customers for volume-pricing offers. Its main limitations are that product and customer histories come from only four months, so new products and first-time customers are predicted less accurately, and that the data covers a single retailer and year.
